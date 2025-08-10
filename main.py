@@ -7,7 +7,7 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = f"{os.environ.get('RENDER_EXTERNAL_URL')}/{TOKEN}"
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 reminders = {}
 
@@ -37,16 +37,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
+    chat_id = update.effective_chat.id
 
     if query.data == "main_menu":
         await query.edit_message_text("Головне меню:", reply_markup=main_menu())
 
     elif query.data == "set_reminder":
         context.user_data["step"] = "waiting_for_task"
-        await query.edit_message_text("Введіть текст нагадування:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅ Назад", callback_data="main_menu")]]
-        ))
+        await query.edit_message_text("Введіть текст нагадування:",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("⬅ Назад", callback_data="main_menu")]]
+                                      ))
 
     elif query.data == "list_reminders":
         user_reminders = reminders.get(chat_id, [])
@@ -69,7 +70,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Нагадування видалено.", reply_markup=main_menu())
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
+    chat_id = update.effective_chat.id
     step = context.user_data.get("step")
 
     if step == "waiting_for_task":
@@ -104,7 +105,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
+    chat_id = update.effective_chat.id
 
     task = context.user_data["task"]
     remind_time = context.user_data["time"]
@@ -123,7 +124,7 @@ def schedule_reminder(context, chat_id, remind_time, task, repeat_type):
     now = datetime.now()
     delay = (remind_time - now).total_seconds()
     job_id = f"reminder_{chat_id}_{int(remind_time.timestamp())}"
-    context.job_queue.run_once(job_send, delay, data={"chat_id": chat_id, "task": task, "repeat_type": repeat_type}, name=job_id)
+    context.job_queue.run_once(job_send, delay, data={"chat_id": chat_id, "task": task, "repeat_type": repeat_type})
     return job_id
 
 async def job_send(context: ContextTypes.DEFAULT_TYPE):
@@ -160,7 +161,7 @@ def run_app():
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
-        url_path=TOKEN,
+        url_path="",
         webhook_url=WEBHOOK_URL
     )
 
