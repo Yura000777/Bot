@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -14,46 +14,57 @@ WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 DATA_FILE = "reminders.json"
-
 reminders = {}
 
-# -------- Збереження/завантаження --------
-def save_reminders():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(reminders, f, default=str, ensure_ascii=False)
-
+# ===== Збереження / завантаження нагадувань =====
 def load_reminders():
     global reminders
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            for chat_id, rem_list in data.items():
+            for chat_id, rems in data.items():
                 reminders[int(chat_id)] = [
-                    {**r, "time": datetime.fromisoformat(r["time"])} for r in rem_list
+                    {
+                        "task": r["task"],
+                        "time": KYIV_TZ.localize(datetime.fromisoformat(r["time"])),
+                        "repeat": r["repeat"]
+                    }
+                    for r in rems
                 ]
 
-# -------- Формат виводу часу --------
+def save_reminders():
+    data = {}
+    for chat_id, rems in reminders.items():
+        data[chat_id] = [
+            {
+                "task": r["task"],
+                "time": r["time"].isoformat(),
+                "repeat": r["repeat"]
+            }
+            for r in rems
+        ]
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ===== Форматування часу =====
 def format_time_delta(td):
     days = td.days
     hours, remainder = divmod(td.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
     parts = []
-    if days > 0:
-        parts.append(f"{days} дн")
-    if hours > 0:
-        parts.append(f"{hours} год")
-    if minutes > 0:
-        parts.append(f"{minutes} хв")
+    if days > 0: parts.append(f"{days} дн")
+    if hours > 0: parts.append(f"{hours} год")
+    if minutes > 0: parts.append(f"{minutes} хв")
     return " ".join(parts) if parts else "менше хвилини"
 
-# -------- Клавіатура --------
+# ===== Меню =====
 def main_menu():
-    return InlineKeyboardMarkup([
+    keyboard = [
         [InlineKeyboardButton("➕ Додати нагадування", callback_data="set_reminder")],
         [InlineKeyboardButton("📋 Список нагадувань", callback_data="list_reminders")]
-    ])
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# -------- Безпечне редагування --------
 async def safe_edit_message_text(query, text, **kwargs):
     try:
         if query.message.text != text:
@@ -62,11 +73,10 @@ async def safe_edit_message_text(query, text, **kwargs):
         if "Message is not modified" not in str(e):
             raise
 
-# -------- Команди --------
+# ===== Команди =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Вітаю! Оберіть дію:", reply_markup=main_menu())
 
-# -------- Обробка кнопок --------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -102,22 +112,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_reminders()
             await safe_edit_message_text(query, "Нагадування видалено.", reply_markup=main_menu())
 
-# -------- Ввід повідомлень --------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     step = context.user_data.get("step")
 
     if step == "waiting_for_task":
         context.user_data["task"] = update.message.text
         context.user_data["step"] = "waiting_for_time"
-        await update.message.reply_text("Введіть час у форматі HH:MM (24-годинний, київський час):",
+        await update.message.reply_text("Введіть час у форматі HH:MM (24-годинний):",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Назад", callback_data="main_menu")]]))
 
     elif step == "waiting_for_time":
         try:
             chosen_time = datetime.strptime(update.message.text, "%H:%M").time()
             now = datetime.now(KYIV_TZ)
-            remind_datetime = datetime.combine(now.date(), chosen_time, tzinfo=KYIV_TZ)
+            remind_datetime = KYIV_TZ.localize(datetime.combine(now.date(), chosen_time))
             if remind_datetime < now:
                 remind_datetime += timedelta(days=1)
             context.user_data["time"] = remind_datetime
@@ -134,7 +142,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Невірний формат. Спробуйте ще раз.")
 
-# -------- Обробка повторів --------
 async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -144,30 +151,21 @@ async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remind_time = context.user_data["time"]
     repeat_type = query.data.replace("repeat_", "")
 
-    # корекція для буднів/вихідних
-    if repeat_type == "weekdays":
-        while remind_time.weekday() >= 5:
-            remind_time += timedelta(days=1)
-    elif repeat_type == "weekends":
-        while remind_time.weekday() < 5:
-            remind_time += timedelta(days=1)
-
     job_id = schedule_reminder(context, chat_id, remind_time, task, repeat_type)
 
     if chat_id not in reminders:
         reminders[chat_id] = []
-    reminders[chat_id].append({"task": task, "time": remind_time, "repeat": repeat_type, "job_id": job_id})
+    reminders[chat_id].append({"task": task, "time": remind_time, "repeat": repeat_type})
     save_reminders()
 
     await safe_edit_message_text(query, "Нагадування створено ✅", reply_markup=main_menu())
     context.user_data.clear()
 
-# -------- Планування --------
 def schedule_reminder(context, chat_id, remind_time, task, repeat_type):
-    delay = (remind_time - datetime.now(KYIV_TZ)).total_seconds()
-    job_id = f"reminder_{chat_id}_{int(remind_time.timestamp())}"
+    now = datetime.now(KYIV_TZ)
+    delay = (remind_time - now).total_seconds()
     context.job_queue.run_once(job_send, delay, data={"chat_id": chat_id, "task": task, "repeat_type": repeat_type})
-    return job_id
+    return f"{chat_id}_{int(remind_time.timestamp())}"
 
 async def job_send(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
@@ -176,7 +174,8 @@ async def job_send(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id, text=f"🔔 Нагадування: {task}")
 
-    now = datetime.now(KYIV_TZ).replace(second=0, microsecond=0)
+    now = datetime.now(KYIV_TZ)
+
     if repeat_type == "daily":
         next_time = now + timedelta(days=1)
     elif repeat_type == "weekdays":
@@ -187,24 +186,22 @@ async def job_send(context: ContextTypes.DEFAULT_TYPE):
         next_time = now + timedelta(days=1)
         while next_time.weekday() < 5:
             next_time += timedelta(days=1)
-    else:
-        # разове нагадування — видаляємо
-        for chat_id_r, rem_list in list(reminders.items()):
-            reminders[chat_id_r] = [r for r in rem_list if not (r["task"] == task and r["repeat"] == "once")]
-        save_reminders()
+    else:  # once
         return
 
-    # зберігаємо повтор
-    for rem_list in reminders.values():
-        for r in rem_list:
-            if r["task"] == task and r["repeat"] == repeat_type:
-                r["time"] = next_time
-    save_reminders()
     schedule_reminder(context, chat_id, next_time, task, repeat_type)
 
-# -------- Запуск --------
+def restore_jobs(app):
+    now = datetime.now(KYIV_TZ)
+    for chat_id, rems in reminders.items():
+        for r in rems:
+            if r["time"] > now:
+                app.job_queue.run_once(job_send, (r["time"] - now).total_seconds(),
+                                       data={"chat_id": chat_id, "task": r["task"], "repeat_type": r["repeat"]})
+
 def run_app():
     load_reminders()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -212,11 +209,7 @@ def run_app():
     app.add_handler(CallbackQueryHandler(repeat_handler, pattern="^repeat_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # відновлення нагадувань після рестарту
-    for chat_id, rem_list in reminders.items():
-        for r in rem_list:
-            if r["time"] > datetime.now(KYIV_TZ):
-                schedule_reminder(app, chat_id, r["time"], r["task"], r["repeat"])
+    restore_jobs(app)
 
     app.run_webhook(
         listen="0.0.0.0",
