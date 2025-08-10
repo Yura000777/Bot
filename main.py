@@ -5,15 +5,11 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
 )
-from apscheduler.schedulers.background import BackgroundScheduler
 
-TOKEN = os.environ.get("BOT_TOKEN")  # Token з Environment Variables
-WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_URL')}/{TOKEN}"
+TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = f"{os.environ.get('RENDER_EXTERNAL_URL')}/{TOKEN}"
 
 reminders = {}
-scheduler = BackgroundScheduler()
-scheduler.start()
-
 
 def format_time_delta(td):
     days = td.days
@@ -28,7 +24,6 @@ def format_time_delta(td):
         parts.append(f"{minutes} хв")
     return " ".join(parts) if parts else "менше хвилини"
 
-
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("➕ Додати нагадування", callback_data="set_reminder")],
@@ -36,10 +31,8 @@ def main_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Вітаю! Оберіть дію:", reply_markup=main_menu())
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -75,7 +68,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reminders[chat_id].pop(idx)
             await query.edit_message_text("Нагадування видалено.", reply_markup=main_menu())
 
-
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     step = context.user_data.get("step")
@@ -109,7 +101,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Невірний формат. Спробуйте ще раз.")
 
-
 async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -128,36 +119,35 @@ async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Нагадування створено ✅", reply_markup=main_menu())
     context.user_data.clear()
 
-
 def schedule_reminder(context, chat_id, remind_time, task, repeat_type):
     now = datetime.now()
-    first_seconds = (remind_time - now).total_seconds()
+    delay = (remind_time - now).total_seconds()
     job_id = f"reminder_{chat_id}_{int(remind_time.timestamp())}"
-    data = {"chat_id": chat_id, "task": task, "repeat_type": repeat_type}
-    context.job_queue.run_once(job_send, when=first_seconds, data=data, name=job_id)
+    context.job_queue.run_once(job_send, delay, data={"chat_id": chat_id, "task": task, "repeat_type": repeat_type}, name=job_id)
     return job_id
-
 
 async def job_send(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     task = context.job.data["task"]
     repeat_type = context.job.data["repeat_type"]
+
     await context.bot.send_message(chat_id, text=f"🔔 Нагадування: {task}")
 
+    now = datetime.now()
     if repeat_type == "daily":
-        next_time = datetime.now() + timedelta(days=1)
-        schedule_reminder(context, chat_id, next_time, task, repeat_type)
+        next_time = now + timedelta(days=1)
     elif repeat_type == "weekdays":
-        next_time = datetime.now() + timedelta(days=1)
+        next_time = now + timedelta(days=1)
         while next_time.weekday() >= 5:
             next_time += timedelta(days=1)
-        schedule_reminder(context, chat_id, next_time, task, repeat_type)
     elif repeat_type == "weekends":
-        next_time = datetime.now() + timedelta(days=1)
+        next_time = now + timedelta(days=1)
         while next_time.weekday() < 5:
             next_time += timedelta(days=1)
-        schedule_reminder(context, chat_id, next_time, task, repeat_type)
+    else:
+        return
 
+    schedule_reminder(context, chat_id, next_time, task, repeat_type)
 
 def run_app():
     app = ApplicationBuilder().token(TOKEN).build()
@@ -173,7 +163,6 @@ def run_app():
         url_path=TOKEN,
         webhook_url=WEBHOOK_URL
     )
-
 
 if __name__ == "__main__":
     run_app()
