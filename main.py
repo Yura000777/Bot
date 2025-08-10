@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
@@ -31,6 +32,24 @@ def main_menu():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# 🔹 Безпечна зміна тексту
+async def safe_edit_message_text(query, text, **kwargs):
+    try:
+        if query.message.text != text:
+            await query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
+
+# 🔹 Безпечна зміна caption
+async def safe_edit_message_caption(query, caption, **kwargs):
+    try:
+        if query.message.caption != caption:
+            await query.edit_message_caption(caption, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Вітаю! Оберіть дію:", reply_markup=main_menu())
 
@@ -40,19 +59,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if query.data == "main_menu":
-        await query.edit_message_text("Головне меню:", reply_markup=main_menu())
+        await safe_edit_message_text(query, "Головне меню:", reply_markup=main_menu())
 
     elif query.data == "set_reminder":
         context.user_data["step"] = "waiting_for_task"
-        await query.edit_message_text("Введіть текст нагадування:",
-                                      reply_markup=InlineKeyboardMarkup(
-                                          [[InlineKeyboardButton("⬅ Назад", callback_data="main_menu")]]
-                                      ))
+        await safe_edit_message_text(
+            query,
+            "Введіть текст нагадування:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅ Назад", callback_data="main_menu")]]
+            )
+        )
 
     elif query.data == "list_reminders":
         user_reminders = reminders.get(chat_id, [])
         if not user_reminders:
-            await query.edit_message_text("У вас немає активних нагадувань.", reply_markup=main_menu())
+            await safe_edit_message_text(query, "У вас немає активних нагадувань.", reply_markup=main_menu())
             return
         text = "📋 Ваші нагадування:\n"
         keyboard = []
@@ -61,13 +83,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{i+1}. {r['task']} ⏳ {remaining}\n"
             keyboard.append([InlineKeyboardButton(f"❌ Видалити {i+1}", callback_data=f"delete_{i}")])
         keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="main_menu")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit_message_text(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif query.data.startswith("delete_"):
         idx = int(query.data.split("_")[1])
         if chat_id in reminders and 0 <= idx < len(reminders[chat_id]):
             reminders[chat_id].pop(idx)
-            await query.edit_message_text("Нагадування видалено.", reply_markup=main_menu())
+            await safe_edit_message_text(query, "Нагадування видалено.", reply_markup=main_menu())
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -117,7 +139,7 @@ async def repeat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminders[chat_id] = []
     reminders[chat_id].append({"task": task, "time": remind_time, "repeat": repeat_type, "job_id": job_id})
 
-    await query.edit_message_text("Нагадування створено ✅", reply_markup=main_menu())
+    await safe_edit_message_text(query, "Нагадування створено ✅", reply_markup=main_menu())
     context.user_data.clear()
 
 def schedule_reminder(context, chat_id, remind_time, task, repeat_type):
