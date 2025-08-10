@@ -158,10 +158,14 @@ def webhook():
 # 📌 Запуск на Render
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5000))
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_url and not render_url.startswith("https://"):
+        render_url = f"https://{render_url}"
+
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=TOKEN,
-        webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_URL')}/{TOKEN}"
+        webhook_url=f"{render_url}/{TOKEN}"
     )
-    flask_app.run(host="0.0.0.0", port=PORT)
+
