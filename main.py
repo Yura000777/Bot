@@ -1,171 +1,138 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request
-import datetime
-import asyncio
 import os
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters
+)
 
-# Токен беремо з Environment Variables
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# ------------------ Налаштування логування ------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Flask сервер
-flask_app = Flask(__name__)
+# ------------------ Змінні середовища ------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN не знайдено у змінних середовища!")
 
-scheduler = BackgroundScheduler()
+# ------------------ Планувальник ------------------
+scheduler = BackgroundScheduler(timezone="Europe/Kyiv")
 scheduler.start()
 
-# Зберігаємо нагадування у пам'яті
-reminders = {}
+# ------------------ Стан розмови ------------------
+CHOOSING_TIME, CHOOSING_REPEAT = range(2)
+user_tasks = {}
 
-# 🔔 Відправка нагадування
-async def send_reminder(bot, chat_id, text):
-    await bot.send_message(chat_id=chat_id, text=f"⏰ Нагадування: {text}")
+# ------------------ Відправка нагадування ------------------
+async def send_reminder(bot, chat_id, task):
+    try:
+        await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {task}")
+    except Exception as e:
+        logger.error(f"Помилка при відправці нагадування: {e}")
 
-# 📌 Головне меню
-async def show_main_menu(update, context):
-    keyboard = [
-        [InlineKeyboardButton("🕒 Встановити нагадування", callback_data="set_reminder")],
-        [InlineKeyboardButton("📋 Список нагадувань", callback_data="list_reminders")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text("📌 Головне меню:", reply_markup=reply_markup)
-    else:
-        await update.message.reply_text("📌 Головне меню:", reply_markup=reply_markup)
-
-# 📌 /start
+# ------------------ Старт ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_main_menu(update, context)
+    await update.message.reply_text("Привіт! Напиши, яке завдання треба нагадати.")
+    return CHOOSING_TIME
 
-# 📌 Обробка кнопок
+# ------------------ Отримання завдання ------------------
+async def set_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    task = update.message.text
+    user_tasks[chat_id] = {"task": task}
+    await update.message.reply_text("⏰ Вкажи час у форматі ГГ:ХХ")
+    return CHOOSING_REPEAT
+
+# ------------------ Отримання часу ------------------
+async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    time_str = update.message.text
+    try:
+        chosen_time = datetime.strptime(time_str, "%H:%M").time()
+        user_tasks[chat_id]["time"] = chosen_time
+
+        keyboard = [
+            [InlineKeyboardButton("Одноразово", callback_data="repeat_once")],
+            [InlineKeyboardButton("Щодня", callback_data="repeat_daily")],
+            [InlineKeyboardButton("Будні", callback_data="repeat_weekdays")],
+            [InlineKeyboardButton("Вихідні", callback_data="repeat_weekends")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("📅 Як повторювати?", reply_markup=reply_markup)
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Невірний формат. Вкажи час як 14:30.")
+        return CHOOSING_REPEAT
+
+# ------------------ Обробка вибору повтору ------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+
     chat_id = query.message.chat_id
+    repeat_type = query.data
+    chosen_task = user_tasks[chat_id]["task"]
+    chosen_time = user_tasks[chat_id]["time"]
 
-    if data == "set_reminder":
-        await query.edit_message_text("⏰ Введи час у форматі HH:MM:", reply_markup=back_button())
-        context.user_data["step"] = "waiting_for_time"
+    now = datetime.now()
+    run_time = datetime.combine(now.date(), chosen_time)
+    if run_time < now:
+        run_time += timedelta(days=1)
 
-    elif data == "list_reminders":
-        user_reminders = reminders.get(chat_id, [])
-        if not user_reminders:
-            await query.edit_message_text("📋 У тебе немає нагадувань.", reply_markup=back_button())
-            return
+    hours = chosen_time.hour
+    minutes = chosen_time.minute
+    job_id = f"{chat_id}_{chosen_time}_{chosen_task}_{repeat_type}"
 
-        keyboard = []
-        for idx, r in enumerate(user_reminders):
-            keyboard.append([InlineKeyboardButton(f"🗑 {r['time']} - {r['text']} ({r['repeat']})", callback_data=f"delete_{idx}")])
-        keyboard.append([InlineKeyboardButton("↩ На початок", callback_data="main_menu")])
+    def job_func():
+        context.application.create_task(
+            send_reminder(context.bot, chat_id, chosen_task)
+        )
 
-        await query.edit_message_text("📋 Твої нагадування:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if repeat_type == "repeat_once":
+        scheduler.add_job(job_func, "date", run_date=run_time, id=job_id)
+    elif repeat_type == "repeat_daily":
+        scheduler.add_job(job_func, "cron", hour=hours, minute=minutes, id=job_id)
+    elif repeat_type == "repeat_weekdays":
+        scheduler.add_job(job_func, "cron", day_of_week="mon-fri", hour=hours, minute=minutes, id=job_id)
+    elif repeat_type == "repeat_weekends":
+        scheduler.add_job(job_func, "cron", day_of_week="sat,sun", hour=hours, minute=minutes, id=job_id)
 
-    elif data.startswith("delete_"):
-        idx = int(data.split("_")[1])
-        if chat_id in reminders and 0 <= idx < len(reminders[chat_id]):
-            job_id = reminders[chat_id][idx]['job_id']
-            scheduler.remove_job(job_id)
-            reminders[chat_id].pop(idx)
-        await show_main_menu(update, context)
+    await query.edit_message_text(
+        text=f"✅ Нагадування '{chosen_task}' встановлено на {chosen_time.strftime('%H:%M')} ({repeat_type})"
+    )
 
-    elif data == "main_menu":
-        await show_main_menu(update, context)
+# ------------------ Запуск ------------------
+def main():
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    elif data.startswith("repeat_"):
-        repeat_type = data.split("_")[1]
-        chosen_time = context.user_data.get("chosen_time")
-        chosen_task = context.user_data.get("chosen_task")
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CHOOSING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_task)],
+            CHOOSING_REPEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_time)],
+        },
+        fallbacks=[]
+    )
 
-        now = datetime.datetime.now()
-        hours, minutes = map(int, chosen_time.split(":"))
-        run_time = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
-        if run_time < now:
-            run_time += datetime.timedelta(days=1)
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-        job_id = f"{chat_id}_{chosen_time}_{chosen_task}_{repeat_type}"
-        if repeat_type == "once":
-            scheduler.add_job(lambda: asyncio.run(send_reminder(context.bot, chat_id, chosen_task)),
-                              "date", run_date=run_time, id=job_id)
-        elif repeat_type == "daily":
-            scheduler.add_job(lambda: asyncio.run(send_reminder(context.bot, chat_id, chosen_task)),
-                              "cron", hour=hours, minute=minutes, id=job_id)
-        elif repeat_type == "weekdays":
-            scheduler.add_job(lambda: asyncio.run(send_reminder(context.bot, chat_id, chosen_task)),
-                              "cron", day_of_week="mon-fri", hour=hours, minute=minutes, id=job_id)
-        elif repeat_type == "weekends":
-            scheduler.add_job(lambda: asyncio.run(send_reminder(context.bot, chat_id, chosen_task)),
-                              "cron", day_of_week="sat,sun", hour=hours, minute=minutes, id=job_id)
-
-        reminders.setdefault(chat_id, []).append({
-            "time": chosen_time,
-            "text": chosen_task,
-            "repeat": repeat_type,
-            "job_id": job_id
-        })
-
-        context.user_data.clear()
-        await show_main_menu(update, context)
-
-# 📌 Обробка введеного тексту
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
-    chat_id = update.effective_chat.id
-
-    if step == "waiting_for_time":
-        try:
-            chosen_time = update.message.text.strip()
-            datetime.datetime.strptime(chosen_time, "%H:%M")
-            context.user_data["chosen_time"] = chosen_time
-            context.user_data["step"] = "waiting_for_task"
-            await update.message.reply_text("✏️ Що потрібно зробити?", reply_markup=back_button())
-        except ValueError:
-            await update.message.reply_text("⚠ Невірний формат часу! Використай HH:MM")
-
-    elif step == "waiting_for_task":
-        chosen_task = update.message.text.strip()
-        context.user_data["chosen_task"] = chosen_task
-        context.user_data["step"] = None
-
-        keyboard = [
-            [InlineKeyboardButton("🔁 Щодня", callback_data="repeat_daily")],
-            [InlineKeyboardButton("1️⃣ Один раз", callback_data="repeat_once")],
-            [InlineKeyboardButton("📅 По буднях", callback_data="repeat_weekdays")],
-            [InlineKeyboardButton("🏖 По вихідних", callback_data="repeat_weekends")],
-            [InlineKeyboardButton("↩ На початок", callback_data="main_menu")]
-        ]
-        await update.message.reply_text("🔄 Як повторювати нагадування?", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# 📌 Кнопка повернення
-def back_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩ На початок", callback_data="main_menu")]])
-
-# 🚀 Створення бота
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(button_handler))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-# 📌 Flask webhook endpoint
-@flask_app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put(update)
-    return "ok"
-
-# 📌 Запуск на Render
-if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5000))
+    # Запуск через webhook (Render)
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if render_url and not render_url.startswith("https://"):
-        render_url = f"https://{render_url}"
+    if not render_url:
+        raise ValueError("❌ RENDER_EXTERNAL_URL не знайдено у змінних середовища!")
 
     application.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=int(os.environ.get("PORT", 5000)),
         url_path=TOKEN,
         webhook_url=f"{render_url}/{TOKEN}"
     )
 
+if __name__ == "__main__":
+    main()
